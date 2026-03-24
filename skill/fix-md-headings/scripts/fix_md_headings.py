@@ -120,10 +120,14 @@ def is_valid_pattern_heading(heading_text):
     Check if heading matches a valid pattern that should be kept.
     Returns (is_valid, level) tuple.
     
-    Valid patterns:
+    Valid patterns (only for cases where PDF has no bookmarks):
     - Chapter titles: CHAPTER ONE, CHAPTER 1
-    - Numbered sections: 1.1, 2.3.1 (NOT (1), (10), etc.)
+    - Numbered sections: 1.1, 2.3.1 (NOT single digit like "1.", "2.")
     - Control codes: AC-1, AU-2, SA-8
+    
+    Note: Single-digit numbered items like "1. Private signature key" are
+    typically list items in tables, NOT section headings. These should NOT
+    be matched as headings.
     """
     text = heading_text.strip()
     text_upper = text.upper()
@@ -135,39 +139,19 @@ def is_valid_pattern_heading(heading_text):
     if re.match(r'^PART\s+(ONE|TWO|THREE|FOUR|FIVE|\d+)', text_upper):
         return True, 1
     
-    # Numbered sections: 1.1, 2.3.1, etc. (NOT (1), (10), etc.)
-    # Must start with digit, not parenthesis
-    num_match = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?\s+', text)
+    # Numbered sections: 1.1, 2.3.1, etc. (NOT single digit like "1.", "2.")
+    # Require at least 2 parts (e.g., 1.1, 2.3) to be considered a section heading
+    # Single digit numbers (1., 2., etc.) are typically list items in tables
+    num_match = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?\s+', text)
     if num_match:
         parts = [p for p in num_match.groups() if p]
-        return True, min(len(parts) + 1, 5)
+        # Require at least 2 parts (e.g., 1.1, not just 1.)
+        if len(parts) >= 2:
+            return True, min(len(parts) + 1, 5)
     
     # Control codes: AC-1, AU-2, SA-8, etc. = level 3
     if re.match(r'^[A-Z]{2}-\d+', text):
         return True, 3
-    
-    # Section keywords = level 2 (must be main content, not just contained)
-    section_keywords_exact = [
-        'PURPOSE AND APPLICABILITY',
-        'PURPOSE',
-        'TARGET AUDIENCE',
-        'ORGANIZATION OF THIS PUBLICATION',
-        'ORGANIZATION OF THIS',
-        'RISK MANAGEMENT',
-        'REQUIREMENTS AND CONTROLS',
-        'CONTROL STRUCTURE AND ORGANIZATION',
-        'CONTROL IMPLEMENTATION APPROACHES',
-        'TRUSTWORTHINESS AND ASSURANCE',
-        'EVIDENCE OF CONTROL IMPLEMENTATION',
-    ]
-    
-    for kw in section_keywords_exact:
-        if text_upper.startswith(kw) or text_upper == kw:
-            return True, 2
-    
-    for kw in section_keywords_exact:
-        if kw in text_upper and len(kw) > len(text_upper) * 0.7:
-            return True, 2
     
     return False, None
 
@@ -204,9 +188,12 @@ def build_bookmark_map(bookmarks):
 def match_heading_to_bookmark(heading_text, bookmark_map):
     """
     Try to match heading to a bookmark.
-    Priority: exact match > startswith match > contains match > word overlap
+    Priority: exact match > startswith match > word overlap
     
     Returns matched level or None.
+    
+    Important: Does NOT use simple substring matching to avoid false positives
+    like "1. Private signature key" matching "B.2.1. Private Signature Key".
     """
     normalized_heading = normalize_title(heading_text).lower()
     
@@ -214,42 +201,47 @@ def match_heading_to_bookmark(heading_text, bookmark_map):
     if normalized_heading in bookmark_map:
         return bookmark_map[normalized_heading]
     
-    # Priority 2: Heading starts with bookmark title
+    # Priority 2: Heading starts with bookmark title (exact prefix)
     for bm_title, bm_level in bookmark_map.items():
         if normalized_heading.startswith(bm_title + ' ') or normalized_heading.startswith(bm_title):
             return bm_level
     
-    # Priority 3: Bookmark title starts with heading
+    # Priority 3: Bookmark title starts with heading (exact prefix)
+    # Only match if heading looks like a proper section number prefix
+    # e.g., "B.2" can match "B.2.1", but "1." should NOT match "B.2.1"
     for bm_title, bm_level in bookmark_map.items():
-        if bm_title.startswith(normalized_heading + ' ') or bm_title.startswith(normalized_heading):
-            return bm_level
+        if bm_title.startswith(normalized_heading + ' ') or bm_title.startswith(normalized_heading + '.'):
+            # Additional check: heading should look like a valid section prefix
+            # Reject single digit followed by dot (e.g., "1.", "2.")
+            if not re.match(r'^\d+\.$', normalized_heading):
+                return bm_level
     
-    # Priority 4: Substring match
-    for bm_title, bm_level in bookmark_map.items():
-        if bm_title in normalized_heading or normalized_heading in bm_title:
-            return bm_level
-    
-    # Priority 5: Word overlap (strict - require 80% overlap)
-    if len(normalized_heading) > 10:
+    # Priority 4: Word overlap (strict - require 90% overlap, not 80%)
+    if len(normalized_heading) > 15:  # Only for longer headings
         heading_words = set(normalized_heading.split())
         for bm_title, bm_level in bookmark_map.items():
-            if len(bm_title) <= 10:
+            if len(bm_title) <= 15:
                 continue
             bookmark_words = set(bm_title.split())
             overlap = len(heading_words & bookmark_words)
-            if overlap >= len(heading_words) * 0.8:
+            # Require 90% overlap (more strict than before)
+            if overlap >= len(heading_words) * 0.9 and overlap >= len(bookmark_words) * 0.9:
                 return bm_level
     
     return None
 
 def fix_headings(md_content, bookmarks):
     """
-    Fix heading levels.
-    - Matched headings: keep with proper level
-    - Unmatched headings that look like body text: convert to plain text
-    - Other unmatched headings: convert to **bold text**
-    - Headings in Table of Contents without bookmark match: convert to **bold text**
-    - Headings in single-heading appendices (D, E, F): convert to plain text or bold
+    Fix heading levels based STRICTLY on PDF bookmarks.
+    
+    Rules:
+    - Headings matched to PDF bookmarks: keep with proper level from bookmark
+    - Headings NOT in PDF bookmarks: convert to **bold text** (not headings)
+    - Special sections (TOC, References, etc.): kept as headings even without bookmark
+    - Single-heading appendices (D, E, F): only main title is heading, rest are bold
+    - Plain text patterns: convert to plain text (not bold)
+    
+    This ensures the Markdown heading structure matches the PDF outline exactly.
     """
     lines = md_content.split('\n')
     fixed_lines = []
@@ -294,6 +286,7 @@ def fix_headings(md_content, bookmarks):
             chapter_match = re.match(r'^#+\s*(CHAPTER\s+(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|\d+)|PART\s+(ONE|TWO|THREE|FOUR|FIVE|\d+)|REFERENCES|APPENDIX\s+[A-Z])\s*$', line, re.IGNORECASE)
             if chapter_match:
                 in_table_of_contents = False
+        
         match = re.match(r'^(#+)\s+(.+)$', line)
         if match:
             stats['total_headings'] += 1
@@ -319,7 +312,7 @@ def fix_headings(md_content, bookmarks):
                 stats['converted_to_plain'] += 1
                 continue
             
-            # Try bookmark match first
+            # Try bookmark match first (PRIMARY method)
             matched_level = match_heading_to_bookmark(heading_text, bookmark_map)
             
             # Special handling for Table of Contents:
@@ -329,12 +322,10 @@ def fix_headings(md_content, bookmarks):
                 stats['converted_to_bold'] += 1
                 continue
             
-            # If no bookmark match, check pattern-based rules
-            if matched_level is None:
-                matched_level = determine_heading_level(heading_text, prev_level)
-            
+            # STRICT MODE: If no bookmark match, convert to bold (NOT heading)
+            # Only keep as heading if matched to PDF bookmark
             if matched_level is not None:
-                # Keep as heading with proper level
+                # Keep as heading with proper level from bookmark
                 new_level = matched_level
                 if new_level > prev_level + 1:
                     new_level = prev_level + 1
@@ -345,7 +336,8 @@ def fix_headings(md_content, bookmarks):
                 stats['level_distribution'][new_level] = stats['level_distribution'].get(new_level, 0) + 1
                 prev_level = new_level
             else:
-                # No match - convert to **bold text**
+                # No bookmark match - convert to **bold text**
+                # This is the key change: NO fallback to pattern matching
                 fixed_lines.append(f"**{heading_text}**")
                 stats['converted_to_bold'] += 1
         else:

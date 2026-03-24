@@ -50,6 +50,26 @@ The following appendices should have **only one heading** (the main appendix tit
 - **Appendix E**: Glossary (term definitions → bold)
 - **Appendix F**: Change Log (numbered list items → plain text)
 
+### Strict Bookmark Matching Mode
+
+**Important:** This skill uses **strict bookmark matching**. This means:
+
+1. **Headings matched to PDF bookmarks** → Kept as headings with proper level
+2. **Headings NOT in PDF bookmarks** → Converted to **bold text** (not headings)
+3. **No fallback to pattern matching** → Unlike some tools, this skill does NOT try to guess heading levels from text patterns
+
+This ensures the Markdown heading structure matches the PDF outline exactly, preventing false positives where body content is incorrectly marked as headings.
+
+#### Why Strict Mode?
+
+Many PDF-to-Markdown converters (like MinerU) incorrectly mark body content as headings. For example:
+
+- "Implement the security..." → Should be body text, not heading
+- "Discussion: This control..." → Should be body text, not heading
+- Random bold text in PDF → Should not become Markdown headings
+
+By strictly matching PDF bookmarks, this skill ensures only actual section headings remain as headings in the Markdown output.
+
 ### Pattern Recognition
 
 The skill also recognizes these patterns as valid headings:
